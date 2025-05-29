@@ -121,3 +121,138 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     # - Yêu cầu: "Không được đóng kết nối bên trong các hàm đã triển khai"
     # - Test sẽ tự quản lý việc commit và đóng kết nối
     # -----------------------------------------
+    con.commit()
+    cur.close()
+
+def rangepartition(ratingstablename, numberofpartitions, openconnection):
+    """
+    Hàm tạo các phân mảnh (partitions) của bảng `ratingstablename` dựa trên giá trị của cột `rating`.
+
+    Parameters:
+    ----------
+    ratingstablename : str
+        Tên bảng chứa dữ liệu đánh giá (ratings) gốc, ví dụ: "ratings".
+    numberofpartitions : int
+        Số lượng phân mảnh cần tạo (ví dụ: 5).
+    openconnection : psycopg2.connection
+        Đối tượng kết nối đến cơ sở dữ liệu PostgreSQL.
+
+    Mục đích:
+    --------
+    - Chia bảng `ratings` thành các bảng nhỏ hơn `range_part0`, `range_part1`, ..., `range_part{N-1}`
+      dựa trên các khoảng giá trị đồng đều của cột `rating`.
+    - Dải rating giả định trong khoảng [0, 5].
+
+    Lưu ý:
+    ------
+    - Tên bảng phân mảnh phải bắt đầu bằng `range_part` để tương thích với bộ kiểm thử.
+    - Không được trùng lặp dữ liệu giữa các phân mảnh (tức là mỗi dòng chỉ thuộc một phân mảnh).
+    """
+    con = openconnection # Kết nối cơ sở dữ liệu đã mở sẵn
+    cur = con.cursor() # Tạo đối tượng thực thi truy vấn SQL
+
+    # Tính khoảng cách giữa các phân mảnh (mỗi phân mảnh bao nhiêu đơn vị rating)
+    delta = 5 / numberofpartitions  # Nếu có 5 phân mảnh thì delta = 1.0
+    RANGE_TABLE_PREFIX = 'range_part' # Tiền tố tên bảng phân mảnh
+
+    # Duyệt qua từng phân mảnh để tạo bảng và chèn dữ liệu
+    for i in range(0, numberofpartitions):
+        minRange = i * delta # Giá trị nhỏ nhất trong phân mảnh thứ i
+        maxRange = minRange + delta # Giá trị lớn nhất trong phân mảnh thứ i
+        table_name = RANGE_TABLE_PREFIX + str(i) # Tên bảng phân mảnh, ví dụ: range_part0
+
+        # Tạo bảng phân mảnh mới với 3 cột chính: userid, movieid, rating
+        cur.execute("create table " + table_name + " (userid integer, movieid integer, rating float);")
+
+        # Chèn dữ liệu từ bảng gốc vào bảng phân mảnh theo điều kiện rating
+        if i == 0:
+            # Phân mảnh đầu tiên chứa cả biên trái và phải: [min, max]
+            cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from " + ratingstablename + " where rating >= " + str(minRange) + " and rating <= " + str(maxRange) + ";")
+        else:
+            # Các phân mảnh còn lại chỉ chứa (min, max]: loại trừ biên trái
+            cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from " + ratingstablename + " where rating > " + str(minRange) + " and rating <= " + str(maxRange) + ";")
+    cur.close() # Đóng cursor
+    con.commit() # Lưu thay đổi vào CSDL
+
+def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
+    """
+    Hàm chèn một dòng dữ liệu mới vào bảng chính `ratings` và vào đúng phân mảnh range tương ứng.
+
+    Parameters:
+    ----------
+    ratingstablename : str
+        Tên bảng gốc chứa dữ liệu ratings (ví dụ: "ratings").
+    userid : int
+        ID của người dùng (user) thực hiện đánh giá.
+    itemid : int
+        ID của bộ phim được đánh giá (trong hệ thống này itemid chính là movieid).
+    rating : float
+        Điểm số đánh giá (giá trị từ 0.0 đến 5.0).
+    openconnection : psycopg2.connection
+        Kết nối đến cơ sở dữ liệu PostgreSQL.
+
+    Mục đích:
+    --------
+    - Đảm bảo mỗi bản ghi được thêm vào cả bảng chính `ratings` và bảng phân mảnh `range_partX`.
+    - Tự động xác định bảng phân mảnh phù hợp dựa trên giá trị `rating`.
+
+    Lưu ý:
+    ------
+    - Phải chèn **cả hai**: bảng gốc và phân mảnh tương ứng.
+    - Nếu `rating` nằm đúng ở biên chia (ví dụ: 2.0), cần chèn vào bảng bên trái để tránh trùng.
+    """
+    con = openconnection
+    cur = con.cursor()
+
+    # -------------------
+    # Bước 1: Chèn vào bảng chính `ratings`
+    insert_main_table = f"""
+            INSERT INTO {ratingstablename} (userid, movieid, rating)
+            VALUES ({userid}, {itemid}, {rating});
+        """
+    cur.execute(insert_main_table)
+
+    # -------------------
+    # Bước 2: Tính toán bảng phân mảnh phù hợp để chèn tiếp
+    RANGE_TABLE_PREFIX = 'range_part' # Tiền tố bảng phân mảnh
+    numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection) # Đếm số phân mảnh hiện có
+    delta = 5 / numberofpartitions # Độ rộng của mỗi khoảng phân mảnh
+
+    index = int(rating / delta) # Xác định phân mảnh dựa trên giá trị rating
+
+    # Nếu rating là biên chia (ví dụ: 2.0) và không phải phân mảnh đầu tiên,
+    # thì trừ đi 1 để nó thuộc phân mảnh bên trái (đảm bảo không bị trùng)
+    if rating % delta == 0 and index != 0:
+        index = index - 1
+    table_name = RANGE_TABLE_PREFIX + str(index) # Tên bảng phân mảnh cần chèn
+
+    # Chèn dòng vào bảng phân mảnh tương ứng
+    cur.execute("insert into " + table_name + "(userid, movieid, rating) values (" + str(userid) + "," + str(itemid) + "," + str(rating) + ");")
+    cur.close()
+    con.commit() # Lưu thay đổi
+
+def count_partitions(prefix, openconnection):
+    """
+    Đếm số lượng bảng phân mảnh có tên bắt đầu với prefix trong cơ sở dữ liệu.
+
+    Parameters:
+    ----------
+    prefix : str
+        Tiền tố tên bảng cần đếm (ví dụ: 'range_part', 'rrobin_part')
+    openconnection : psycopg2.connection
+        Kết nối đến cơ sở dữ liệu.
+
+    Returns:
+    -------
+    int
+        Số lượng bảng phù hợp với tiền tố (tức là số phân mảnh hiện tại).
+    """
+    con = openconnection
+    cur = con.cursor()
+
+    # Truy vấn các bảng người dùng có tên bắt đầu với prefix
+    cur.execute("select count(*) from pg_stat_user_tables where relname like " + "'" + prefix + "%';")
+    count = cur.fetchone()[0] # Lấy giá trị đếm ra từ kết quả truy vấn
+    cur.close()
+
+    return count # Trả về số bảng phân mảnh
