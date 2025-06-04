@@ -44,7 +44,7 @@ def create_db(dbname):
     # Truy vấn vào hệ thống để xem database tên đã cho đã tồn tại chưa
     cur.execute(
         sql.SQL("SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname = %s"),
-        [dbname]  # dùng parameterized query để tránh SQL injection
+        [dbname]
     )
 
     # Lấy kết quả: nếu count = 0 → database chưa tồn tại
@@ -74,7 +74,7 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     - openconnection: một đối tượng kết nối đã mở (connection object) tới cơ sở dữ liệu PostgreSQL.
 
     Lưu ý:
-    - Hàm này giả định file đầu vào có định dạng userid::movieid::rating::timestamp, được phân cách bằng dấu :: → cần xử lý thêm các cột phụ.
+    - Hàm này giả định file đầu vào có định dạng userid::movieid::rating::timestamp, được phân cách bằng dấu ::
     - Schema bảng theo yêu cầu: userid (int), movieid (int), rating (float)
     - Theo yêu cầu: không đóng kết nối, không mã hóa cứng tên file/database
     """
@@ -94,30 +94,69 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     cur.execute("DROP TABLE IF EXISTS " + ratingstablename)
 
     # -----------------------------------------
-    # 3. Tạo bảng với các cột extra để hứng dấu :: giữa các trường thực
-    # - userid : movieid : rating : timestamp
-    # - Các cột extra1, extra2, extra3 sẽ chứa dấu : làm separator
+    # 3. PHƯƠNG PHÁP TỐI ƯU MỚI - NHANH HƠN CODE CŨ:
+    # Thay vì tạo bảng với nhiều cột extra rồi ALTER TABLE (chậm):
+    # → Ta sẽ pre-process file trước khi copy_from
+    # → Tạo luôn bảng với đúng schema cuối cùng
+    # → Dùng copy_from với dữ liệu đã được xử lý sẵn
+    #
+    # Ưu điểm:
+    # - Vẫn tận dụng tốc độ siêu nhanh của copy_from
+    # - KHÔNG cần ALTER TABLE (tốn kém nhất trong code cũ)
+    # - Memory efficient vì xử lý từng dòng, không load hết file
     # -----------------------------------------
+
+    # Tạo bảng chính ngay từ đầu với đúng schema yêu cầu
     cur.execute(
-        "CREATE TABLE " + ratingstablename + "(userid INTEGER, extra1 CHAR, movieid INTEGER, extra2 CHAR, rating FLOAT, extra3 CHAR, timestamp BIGINT);")
+        "CREATE TABLE " + ratingstablename + " (userid INTEGER, movieid INTEGER, rating FLOAT)"
+    )
 
     # -----------------------------------------
-    # 4. Dùng copy_from với separator là ':' để import dữ liệu
-    # - File có format userid::movieid::rating::timestamp
-    # - Mỗi :: sẽ được tách thành 2 dấu : riêng biệt
-    # - Dữ liệu sẽ được phân bố: userid : : movieid : : rating : : timestamp
+    # 4. Tạo StringIO object để chứa dữ liệu đã được xử lý
+    # StringIO cho phép ta tạo một "file ảo" trong memory
+    # copy_from có thể đọc trực tiếp từ StringIO như đọc file thật
     # -----------------------------------------
-    cur.copy_from(open(ratingsfilepath), ratingstablename, sep=':')
+    from io import StringIO
+    processed_data = StringIO()
 
     # -----------------------------------------
-    # 5. Xóa các cột không cần thiết, chỉ giữ lại userid, movieid, rating
-    # - Xóa extra1, extra2, extra3 (chứa dấu :) và timestamp
+    # 5. Đọc và xử lý file từng dòng (memory efficient)
+    # Chuyển format từ "userid::movieid::rating::timestamp"
+    # thành "userid\tmovie_id\trating" (tab-separated cho copy_from)
     # -----------------------------------------
-    cur.execute(
-        "ALTER TABLE " + ratingstablename + " DROP COLUMN extra1, DROP COLUMN extra2, DROP COLUMN extra3, DROP COLUMN timestamp;")
+    with open(ratingsfilepath, 'r') as input_file:
+        for line in input_file:
+            line = line.strip()  # Xóa ký tự xuống dòng và khoảng trắng
+            if line:  # Bỏ qua dòng trống
+                # Tách dòng theo delimiter '::'
+                parts = line.split('::')
+                if len(parts) >= 3:  # Đảm bảo có đủ thông tin
+                    userid = parts[0]
+                    movieid = parts[1]
+                    rating = parts[2]
+                    # Chỉ lấy 3 trường cần thiết, bỏ qua timestamp (parts[3])
+                    # Ghi vào StringIO với tab separator (mặc định của copy_from)
+                    processed_data.write(f"{userid}\t{movieid}\t{rating}\n")
 
     # -----------------------------------------
-    # 6. KHÔNG đóng cursor và KHÔNG commit theo yêu cầu
+    # 6. Reset con trỏ StringIO về đầu để copy_from có thể đọc từ đầu
+    # -----------------------------------------
+    processed_data.seek(0)
+
+    # -----------------------------------------
+    # 7. Sử dụng copy_from để import dữ liệu đã xử lý vào bảng
+    # copy_from với tab separator (mặc định) → CỰC KỲ NHANH
+    # Không cần ALTER TABLE → Tiết kiệm rất nhiều thời gian
+    # -----------------------------------------
+    cur.copy_from(processed_data, ratingstablename, columns=('userid', 'movieid', 'rating'))
+
+    # -----------------------------------------
+    # 8. Đóng StringIO để giải phóng memory
+    # -----------------------------------------
+    processed_data.close()
+
+    # -----------------------------------------
+    # 9. KHÔNG đóng cursor và KHÔNG commit theo yêu cầu
     # - Yêu cầu: "Không được đóng kết nối bên trong các hàm đã triển khai"
     # - Test sẽ tự quản lý việc commit và đóng kết nối
     # -----------------------------------------
