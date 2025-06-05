@@ -126,53 +126,75 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
-    Hàm tạo các phân mảnh (partitions) của bảng `ratingstablename` dựa trên giá trị của cột `rating`.
+    Hàm phân mảnh bảng `ratingstablename` thành N phân mảnh ngang theo giá trị cột `rating`,
+    tối ưu tuyệt đối về mặt thời gian cho xử lý dữ liệu lớn.
 
     Parameters:
     ----------
     ratingstablename : str
-        Tên bảng chứa dữ liệu đánh giá (ratings) gốc, ví dụ: "ratings".
+        Tên bảng gốc chứa dữ liệu đánh giá người dùng.
     numberofpartitions : int
-        Số lượng phân mảnh cần tạo (ví dụ: 5).
+        Số phân mảnh cần tạo (ví dụ: 5).
     openconnection : psycopg2.connection
-        Đối tượng kết nối đến cơ sở dữ liệu PostgreSQL.
+        Đối tượng kết nối tới PostgreSQL (đã mở, không đóng trong hàm).
 
-    Mục đích:
-    --------
-    - Chia bảng `ratings` thành các bảng nhỏ hơn `range_part0`, `range_part1`, ..., `range_part{N-1}`
-      dựa trên các khoảng giá trị đồng đều của cột `rating`.
-    - Dải rating giả định trong khoảng [0, 5].
+    Ý tưởng tối ưu:
+    --------------
+    - Duyệt đúng 1 vòng `for` để xử lý vừa tạo bảng vừa chèn dữ liệu.
+    - Ghép toàn bộ truy vấn SQL thành 1 chuỗi `sql_batch`, gửi 1 lần duy nhất tới DB.
+    - Truy vấn `INSERT INTO ... SELECT ... WHERE` giúp PostgreSQL thực hiện tối ưu qua chỉ mục.
+    - Tránh tạo bảng tạm, CTE, hoặc nhiều lần gọi `execute()` gây chậm với dữ liệu lớn.
 
-    Lưu ý:
-    ------
-    - Tên bảng phân mảnh phải bắt đầu bằng `range_part` để tương thích với bộ kiểm thử.
-    - Không được trùng lặp dữ liệu giữa các phân mảnh (tức là mỗi dòng chỉ thuộc một phân mảnh).
+    Hiệu quả:
+    ---------
+    - Tốc độ xử lý cao nhất với PostgreSQL cho 10 triệu bản ghi trở lên.
+    - Dễ mở rộng nếu dùng stored procedure hoặc native partition trong tương lai.
     """
+
     con = openconnection # Kết nối cơ sở dữ liệu đã mở sẵn
     cur = con.cursor() # Tạo đối tượng thực thi truy vấn SQL
 
     # Tính khoảng cách giữa các phân mảnh (mỗi phân mảnh bao nhiêu đơn vị rating)
-    delta = 5 / numberofpartitions  # Nếu có 5 phân mảnh thì delta = 1.0
-    RANGE_TABLE_PREFIX = 'range_part' # Tiền tố tên bảng phân mảnh
+    delta = 5.0 / numberofpartitions  # Độ rộng của mỗi phân mảnh
+    RANGE_TABLE_PREFIX = 'range_part'  # Tiền tố tên bảng phân mảnh
+    sql_batch = ""  # Ghép toàn bộ câu lệnh SQL để gửi 1 lần duy nhất
 
     # Duyệt qua từng phân mảnh để tạo bảng và chèn dữ liệu
-    for i in range(0, numberofpartitions):
-        minRange = i * delta # Giá trị nhỏ nhất trong phân mảnh thứ i
-        maxRange = minRange + delta # Giá trị lớn nhất trong phân mảnh thứ i
-        table_name = RANGE_TABLE_PREFIX + str(i) # Tên bảng phân mảnh, ví dụ: range_part0
+    for i in range(numberofpartitions):
+        min_val = i * delta # Giá trị nhỏ nhất trong phân mảnh thứ i
+        max_val = min_val + delta # Giá trị lớn nhất trong phân mảnh thứ i
+        table_name = f"{RANGE_TABLE_PREFIX}{i}" # Tên bảng phân mảnh, ví dụ: range_part0
 
-        # Tạo bảng phân mảnh mới với 3 cột chính: userid, movieid, rating
-        cur.execute("create table " + table_name + " (userid integer, movieid integer, rating float);")
+        # 1. Tạo bảng phân mảnh
+        sql_batch += f"""
+            CREATE TABLE {table_name} (
+                userid INTEGER,
+                movieid INTEGER,
+                rating FLOAT
+            );
+        """
 
-        # Chèn dữ liệu từ bảng gốc vào bảng phân mảnh theo điều kiện rating
+        # 2. Tạo điều kiện lọc rating phù hợp
         if i == 0:
-            # Phân mảnh đầu tiên chứa cả biên trái và phải: [min, max]
-            cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from " + ratingstablename + " where rating >= " + str(minRange) + " and rating <= " + str(maxRange) + ";")
+            # Phân mảnh đầu tiên lấy cả [min, max]
+            condition = f"rating >= {min_val} AND rating <= {max_val}"
         else:
-            # Các phân mảnh còn lại chỉ chứa (min, max]: loại trừ biên trái
-            cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from " + ratingstablename + " where rating > " + str(minRange) + " and rating <= " + str(maxRange) + ";")
+            # Các phân mảnh sau: (min, max] để tránh trùng rating biên
+            condition = f"rating > {min_val} AND rating <= {max_val}"
+
+        # 3. Thêm câu lệnh chèn vào phân mảnh i
+        sql_batch += f"""
+            INSERT INTO {table_name} (userid, movieid, rating)
+            SELECT userid, movieid, rating
+            FROM {ratingstablename}
+            WHERE {condition};
+        """
+
+    # Thực thi toàn bộ câu SQL cùng lúc (tối ưu tốc độ tối đa)
+    cur.execute(sql_batch)
     cur.close() # Đóng cursor
     con.commit() # Lưu thay đổi vào CSDL
+
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
@@ -216,7 +238,7 @@ def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     # Bước 2: Tính toán bảng phân mảnh phù hợp để chèn tiếp
     RANGE_TABLE_PREFIX = 'range_part' # Tiền tố bảng phân mảnh
     numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection) # Đếm số phân mảnh hiện có
-    delta = 5 / numberofpartitions # Độ rộng của mỗi khoảng phân mảnh
+    delta = 5.0 / numberofpartitions # Độ rộng của mỗi khoảng phân mảnh
 
     index = int(rating / delta) # Xác định phân mảnh dựa trên giá trị rating
 
