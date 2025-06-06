@@ -17,7 +17,6 @@ def getopenconnection(user='postgres', password='1234', dbname='postgres'):
         "dbname='" + dbname + "' user='" + user + "' host='localhost' password='" + password + "'"
     )
 
-
 def create_db(dbname):
     """
     Hàm này dùng để tạo cơ sở dữ liệu PostgreSQL mới với tên được truyền vào (vd: 'dds_assgn1') nếu nó chưa tồn tại.
@@ -62,7 +61,6 @@ def create_db(dbname):
     # ---------------- BƯỚC 4: KHÔNG ĐÓNG KẾT NỐI -------------------
     # - Yêu cầu: "Không được đóng kết nối bên trong các hàm đã triển khai"
     # - Test sẽ tự quản lý việc commit và đóng kết nối
-
 
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
     """
@@ -234,7 +232,6 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
     cur.close() # Đóng cursor
     con.commit() # Lưu thay đổi vào CSDL
 
-
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
     Hàm chèn một dòng dữ liệu mới vào bảng chính `ratings` và vào đúng phân mảnh range tương ứng.
@@ -317,3 +314,138 @@ def count_partitions(prefix, openconnection):
     cur.close()
 
     return count # Trả về số bảng phân mảnh
+
+# Mục tiêu: tối ưu hóa thời gian thực thi của quá trình phân mảnh Round-Robin, 
+# đặc biệt khi làm việc với các tập dữ liệu lớn như MovieLens 10M dòng.
+
+def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
+    """
+    Hàm tối ưu để tạo các phân mảnh của bảng chính bằng phương pháp Round-Robin.
+    Hàm này chỉ quét bảng gốc một lần duy nhất và thực hiện các thao tác một cách hiệu quả.
+    """
+    # Lấy kết nối và con trỏ để thực thi truy vấn
+    con = openconnection
+    cur = con.cursor()
+
+    # Định nghĩa tiền tố tên bảng cho các phân mảnh round robin để dễ quản lý
+    RROBIN_TABLE_PREFIX = 'rrobin_part'
+
+    # --- TỐI ƯU 1: Ghép các lệnh DDL (Data Definition Language) vào một chuỗi ---
+    # Thay vì thực thi 2*N lệnh CREATE/DROP riêng lẻ, ghép chúng lại và
+    # gửi đến server trong một lượt duy nhất để giảm độ trễ mạng.
+    create_partition_sql = ""
+    for i in range(numberofpartitions):
+        # Lệnh xóa bảng phân mảnh cũ nếu nó đã tồn tại để đảm bảo hàm có thể chạy lại nhiều lần.
+        create_partition_sql += f"DROP TABLE IF EXISTS {RROBIN_TABLE_PREFIX}{i};\n"
+        # Lệnh tạo bảng phân mảnh mới với cấu trúc (schema) được định nghĩa trước.
+        create_partition_sql += f"CREATE TABLE {RROBIN_TABLE_PREFIX}{i} (userid INT, movieid INT, rating FLOAT);\n"
+
+    # Thực thi tất cả các câu lệnh tạo/xóa bảng trong một lần gọi duy nhất.
+    cur.execute(create_partition_sql)
+
+    # --- TỐI ƯU 2: Sử dụng CTE và Bảng Tạm để quét bảng gốc MỘT LẦN DUY NHẤT ---
+    # Gắn số thứ tự dòng (row_num), bắt đầu từ 0, cho mỗi dòng dữ liệu từ bảng gốc.
+    # Sử dụng `WITH numbered AS (...)` để thực hiện việc đánh số này.
+    # Sau đó, lưu kết quả (bao gồm cả row_num) vào một bảng tạm thời (`TEMP TABLE`)
+    # có tên là `temp_numbered_rows`. Bảng tạm này chỉ tồn tại trong phiên làm việc hiện tại.
+    # Việc này giúp tránh phải thực thi lại hàm ROW_NUMBER() tốn kém N lần cho N phân mảnh.
+    cur.execute(f"""
+        WITH numbered AS (
+            SELECT userid, movieid, rating,
+                   ROW_NUMBER() OVER () - 1 AS row_num
+            FROM {ratingstablename}
+        )
+        SELECT *
+        INTO TEMP temp_numbered_rows
+        FROM numbered;
+    """)
+
+    # --- TỐI ƯU 3: Ghép các lệnh INSERT vào một chuỗi ---
+    # Tạo một chuỗi truy vấn lớn chứa tất cả các lệnh INSERT vào từng phân mảnh.
+    # Dữ liệu được lấy từ bảng tạm `temp_numbered_rows` đã được tạo ở bước trên.
+    insert_all_sql = ""
+    for i in range(numberofpartitions):
+        # Logic round robin: Dòng nào có (row_num % numberofpartitions) bằng với chỉ số phân mảnh 'i'
+        # thì sẽ được chèn vào phân mảnh thứ 'i'.
+        # PostgreSQL hỗ trợ hàm MOD(a, b) tương đương với toán tử a % b.
+        insert_all_sql += f"""
+        INSERT INTO {RROBIN_TABLE_PREFIX}{i} (userid, movieid, rating)
+        SELECT userid, movieid, rating FROM temp_numbered_rows
+        WHERE MOD(row_num, {numberofpartitions}) = {i};
+        """
+
+    # Thực hiện chèn dữ liệu vào tất cả các bảng phân mảnh trong một lần gọi duy nhất.
+    cur.execute(insert_all_sql)
+
+    # Dọn dẹp: Xóa bảng tạm sau khi đã sử dụng xong để giải phóng tài nguyên trên server.
+    cur.execute("DROP TABLE temp_numbered_rows;")
+
+    # --- Quản lý Metadata ---
+    # Tạo bảng metadata để lưu trữ thông tin cần thiết cho hàm `roundrobininsert`.
+    # `partition_number`: lưu chỉ số của phân mảnh gần nhất đã nhận dữ liệu insert.
+    #                    Khởi tạo là -1 để lần insert đầu tiên, `(-1 + 1) % N` sẽ bằng 0,
+    #                    đưa dữ liệu vào đúng phân mảnh đầu tiên.
+    # `no_of_partitions`: tổng số phân mảnh đang có.
+    cur.execute("DROP TABLE IF EXISTS meta_rrobin_part_info;")
+    cur.execute("""
+        CREATE TABLE meta_rrobin_part_info (
+            partition_number INT,
+            no_of_partitions INT
+        );
+    """)
+    # # Sử dụng truy vấn tham số hóa (%s) để chèn dữ liệu, an toàn hơn ghép chuỗi.
+    cur.execute("INSERT INTO meta_rrobin_part_info VALUES (-1, %s);", (numberofpartitions,))
+
+    # Lưu lại tất cả các thay đổi vào cơ sở dữ liệu và đóng con trỏ.
+    con.commit()
+    cur.close()
+
+def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
+    """
+    Hàm chèn một dòng mới vào bảng gốc và vào đúng phân mảnh theo logic Round-Robin.
+    Được tối ưu và an toàn hơn.
+    """
+    # Lấy kết nối và con trỏ để truy vấn
+    con = openconnection
+    cur = con.cursor()
+    RROBIN_TABLE_PREFIX = 'rrobin_part'
+
+    # Bước 1: Lấy thông tin trạng thái phân mảnh hiện tại từ bảng metadata.
+    cur.execute("SELECT partition_number, no_of_partitions FROM meta_rrobin_part_info;")
+    row = cur.fetchone()
+    if row is None:
+        raise Exception("Bảng metadata cho Round-Robin chưa được khởi tạo. Vui lòng chạy hàm roundrobinpartition trước.")
+    
+    partition_number = row[0]  # Số phân mảnh đã insert gần nhất
+    no_of_partitions = row[1]  # Tổng số phân mảnh
+
+    # Bước 2: Chèn bản ghi vào bảng gốc (để dữ liệu luôn đầy đủ ở một nơi).
+    # SỬ DỤNG TRUY VẤN THAM SỐ HÓA (`%s`) để chèn dữ liệu.
+    # Đây là cách thực hành tốt nhất để chống lại SQL Injection và cải thiện hiệu suất.
+    cur.execute(
+        f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES (%s, %s, %s);",
+        (userid, itemid, rating)
+    )
+
+    # Bước 3: Tính toán chỉ số của phân mảnh tiếp theo theo nguyên tắc round robin.
+    # Ví dụ: nếu lần cuối chèn vào phân mảnh 0 và có 5 phân mảnh,
+    # (0 + 1) % 5 = 1. Lần chèn tiếp theo sẽ vào phân mảnh 1.
+    next_partition = (partition_number + 1) % no_of_partitions
+    partition_table_name = f"{RROBIN_TABLE_PREFIX}{next_partition}"
+
+    # Bước 4: Chèn bản ghi vào bảng phân mảnh tương ứng.
+    # Tiếp tục sử dụng truy vấn tham số hóa để đảm bảo an toàn.
+    cur.execute(
+        f"INSERT INTO {partition_table_name} (userid, movieid, rating) VALUES (%s, %s, %s);",
+        (userid, itemid, rating)
+    )
+
+    # Bước 5: Cập nhật trạng thái partition vừa insert vào bảng metadata.
+    # SỬ DỤNG LỆNH `UPDATE` thay vì `TRUNCATE` + `INSERT`.
+    # Đối với một bảng chỉ có một dòng, `UPDATE` thường hiệu quả hơn vì nó
+    # chỉ sửa đổi dữ liệu tại chỗ thay vì xóa toàn bộ bảng rồi chèn lại.
+    cur.execute("UPDATE meta_rrobin_part_info SET partition_number = %s;", (next_partition,))
+
+    # Bước 6: Lưu tất cả các thay đổi (2 lệnh INSERT và 1 lệnh UPDATE) vào cơ sở dữ liệu và đóng con trỏ.
+    con.commit()
+    cur.close()
