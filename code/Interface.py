@@ -375,6 +375,8 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
         """
 
     # Thực hiện chèn dữ liệu vào tất cả các bảng phân mảnh trong một lần gọi duy nhất.
+    cur.execute("SELECT MAX(row_num) + 1 FROM temp_numbered_rows;")
+    total_rows = cur.fetchone()[0] or 0
     cur.execute(insert_all_sql)
 
     # Dọn dẹp: Xóa bảng tạm sau khi đã sử dụng xong để giải phóng tài nguyên trên server.
@@ -383,8 +385,6 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     # --- Quản lý Metadata ---
     # Tạo bảng metadata để lưu trữ thông tin cần thiết cho hàm `roundrobininsert`.
     # `partition_number`: lưu chỉ số của phân mảnh gần nhất đã nhận dữ liệu insert.
-    #                    Khởi tạo là -1 để lần insert đầu tiên, `(-1 + 1) % N` sẽ bằng 0,
-    #                    đưa dữ liệu vào đúng phân mảnh đầu tiên.
     # `no_of_partitions`: tổng số phân mảnh đang có.
     cur.execute("DROP TABLE IF EXISTS meta_rrobin_part_info;")
     cur.execute("""
@@ -394,7 +394,9 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
         );
     """)
     # # Sử dụng truy vấn tham số hóa (%s) để chèn dữ liệu, an toàn hơn ghép chuỗi.
-    cur.execute("INSERT INTO meta_rrobin_part_info VALUES (-1, %s);", (numberofpartitions,))
+    last_partition = (total_rows - 1) % numberofpartitions if total_rows > 0 else -1
+
+    cur.execute("INSERT INTO meta_rrobin_part_info VALUES (%s, %s);", (last_partition, numberofpartitions))
 
     # Lưu lại tất cả các thay đổi vào cơ sở dữ liệu và đóng con trỏ.
     con.commit()
